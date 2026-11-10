@@ -8,6 +8,10 @@ struct MapHomeView: View {
     @StateObject private var search = PlaceSearchCompleter()
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var searchText = ""
+    @State private var naverResults: [NaverAddress] = []
+    @State private var isSearchingNaver = false
+    @State private var naverSearchMessage: String?
+    @State private var naverSearchRequestID = UUID()
     @FocusState private var searchFocused: Bool
     @State private var routeStart: CLLocationCoordinate2D?
     @State private var routeEnd: CLLocationCoordinate2D?
@@ -167,7 +171,7 @@ struct MapHomeView: View {
 
             searchBar
 
-            if !searchText.isEmpty && !search.results.isEmpty {
+            if !searchText.isEmpty && (!search.results.isEmpty || !naverResults.isEmpty || isSearchingNaver || naverSearchMessage != nil) {
                 searchResults
             }
 
@@ -192,14 +196,23 @@ struct MapHomeView: View {
                 .submitLabel(.search)
                 .onSubmit {
                     searchFocused = false
+                    Task { await searchNaverAddress(searchText) }
                 }
                 .onChange(of: searchText) { _, value in
                     search.query = value
+                    naverResults = []
+                    naverSearchMessage = nil
+                    isSearchingNaver = false
+                    naverSearchRequestID = UUID()
                 }
             if searchFocused || !searchText.isEmpty {
                 Button {
                     searchText = ""
                     search.query = ""
+                    naverResults = []
+                    naverSearchMessage = nil
+                    isSearchingNaver = false
+                    naverSearchRequestID = UUID()
                     searchFocused = false
                 } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -222,16 +235,49 @@ struct MapHomeView: View {
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
+    /// If a query looks like a Korean lot-number address and Naver reports
+    /// no exact match, do not offer unrelated Apple suggestions as substitutes.
+    private var shouldSuppressAppleResults: Bool {
+        guard naverSearchMessage != nil else { return false }
+        let compact = searchText.replacingOccurrences(of: " ", with: "")
+        let isRoadAddress = compact.range(of: "(대로|로|길)[0-9]", options: .regularExpression) != nil
+        let hasTrailingLotNumber = compact.range(of: "[0-9]+(-[0-9]+)?$", options: .regularExpression) != nil
+        return hasTrailingLotNumber && !isRoadAddress
+    }
+
     private var searchResults: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(search.results.prefix(5), id: \.self) { item in
+            if isSearchingNaver {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Searching Korean addresses…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(12)
+            }
+
+            if let message = naverSearchMessage {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+            }
+
+            ForEach(naverResults) { item in
                 Button {
-                    select(completion: item)
+                    select(naverAddress: item)
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
-                        if !item.subtitle.isEmpty {
-                            Text(item.subtitle).font(.caption).foregroundStyle(.secondary)
+                        Text(item.jibunAddress.isEmpty ? item.roadAddress : item.jibunAddress)
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                        if !item.roadAddress.isEmpty && !item.jibunAddress.isEmpty {
+                            Text(item.roadAddress).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -242,9 +288,92 @@ struct MapHomeView: View {
                 .buttonStyle(.plain)
                 Divider().opacity(0.3)
             }
+
+            if !shouldSuppressAppleResults {
+                ForEach(search.results.prefix(5), id: \.self) { item in
+                    Button {
+                        select(completion: item)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                            if !item.subtitle.isEmpty {
+                                Text(item.subtitle).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Divider().opacity(0.3)
+                }
+            }
         }
         .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func searchNaverAddress(_ rawQuery: String) async {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        let requestID = UUID()
+
+        await MainActor.run {
+            naverSearchRequestID = requestID
+            isSearchingNaver = true
+            naverResults = []
+            naverSearchMessage = nil
+        }
+
+        do {
+            var components = URLComponents(string: "https://locus-address.kmh6304.workers.dev/geocode")!
+            components.queryItems = [URLQueryItem(name: "q", value: query)]
+            guard let url = components.url else { throw URLError(.badURL) }
+
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw URLError(.badServerResponse)
+            }
+
+            let decoded = try JSONDecoder().decode(NaverGeocodeResponse.self, from: data)
+            await MainActor.run {
+                // Ignore a response if the user has already changed the search text.
+                guard naverSearchRequestID == requestID,
+                      searchText.trimmingCharacters(in: .whitespacesAndNewlines) == query else { return }
+                naverResults = decoded.addresses.filter {
+                    Double($0.x) != nil && Double($0.y) != nil
+                }
+                naverSearchMessage = decoded.message
+                isSearchingNaver = false
+            }
+        } catch {
+            await MainActor.run {
+                // Do not let an old request overwrite the state of a newer search.
+                guard naverSearchRequestID == requestID,
+                      searchText.trimmingCharacters(in: .whitespacesAndNewlines) == query else { return }
+                isSearchingNaver = false
+                session.lastError = "Korean address search failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func select(naverAddress: NaverAddress) {
+        guard let longitude = Double(naverAddress.x),
+              let latitude = Double(naverAddress.y) else { return }
+        let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        let title = naverAddress.jibunAddress.isEmpty ? naverAddress.roadAddress : naverAddress.jibunAddress
+
+        session.pin = coordinate
+        pinPlaceName = title
+        position = .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: 1200, longitudinalMeters: 1200))
+        searchText = ""
+        search.query = ""
+        naverResults = []
+        naverSearchMessage = nil
+        searchFocused = false
+        session.addFavorite(name: title, coordinate: coordinate)
+        session.pushNamedRecent(name: title, coordinate: coordinate)
     }
 
     private var mapChromeButtons: some View {
@@ -450,4 +579,20 @@ final class PlaceSearchCompleter: NSObject, ObservableObject, MKLocalSearchCompl
     nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
         Task { @MainActor in self.results = [] }
     }
+}
+
+
+private struct NaverGeocodeResponse: Decodable {
+    let success: Bool?
+    let addresses: [NaverAddress]
+    let message: String?
+}
+
+private struct NaverAddress: Decodable, Identifiable {
+    let roadAddress: String
+    let jibunAddress: String
+    let x: String
+    let y: String
+
+    var id: String { "\(x)-\(y)-\(jibunAddress)" }
 }
