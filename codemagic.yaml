@@ -11,20 +11,31 @@ workflows:
     scripts:
       - name: Build Locus for iOS
         script: |
+          mkdir -p "$PWD/build/DerivedData/Build/Products/Release-iphoneos"
+          rm -rf "$PWD/build/DerivedData/Build/Products/Release-iphoneos/Locus.app"
+
           xcodebuild \
             -project Locus.xcodeproj \
             -target Locus \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build/DerivedData \
+            CONFIGURATION_BUILD_DIR="$PWD/build/DerivedData/Build/Products/Release-iphoneos" \
             CODE_SIGNING_ALLOWED=NO \
             build
 
       - name: Package unsigned IPA
         script: |
+          rm -rf Payload build/ipa
           mkdir -p build/ipa
           mkdir -p Payload
+
+          test -d build/DerivedData/Build/Products/Release-iphoneos/Locus.app || {
+            echo "ERROR: Locus.app was not generated."
+            exit 1
+          }
+
           cp -R build/DerivedData/Build/Products/Release-iphoneos/Locus.app Payload/
+
           cd Payload
           zip -r ../build/ipa/Locus.ipa Locus.app
           cd ..
