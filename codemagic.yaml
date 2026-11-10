@@ -1,0 +1,33 @@
+
+workflows:
+  locus-ios:
+    name: Locus iOS Unsigned IPA
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+
+    environment:
+      xcode: latest
+
+    scripts:
+      - name: Build Locus for iOS
+        script: |
+          xcodebuild \
+            -project Locus.xcodeproj \
+            -target Locus \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned IPA
+        script: |
+          mkdir -p build/ipa
+          mkdir -p Payload
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/Locus.app Payload/
+          cd Payload
+          zip -r ../build/ipa/Locus.ipa Locus.app
+          cd ..
+
+    artifacts:
+      - build/ipa/*.ipa
