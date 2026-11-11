@@ -13,40 +13,49 @@ workflows:
         script: |
           set -e
 
-          mkdir -p "$PWD/build/DerivedData/Build/Products/Release-iphoneos"
-          rm -rf "$PWD/build/DerivedData/Build/Products/Release-iphoneos/Locus.app"
+          APP_OUTPUT_DIR="$PWD/build/DerivedData/Build/Products/Release-iphoneos"
+          mkdir -p "$APP_OUTPUT_DIR"
+          rm -rf "$APP_OUTPUT_DIR/Locus.app"
 
           xcodebuild \
             -project Locus.xcodeproj \
             -target Locus \
             -configuration Release \
             -sdk iphoneos \
-            CONFIGURATION_BUILD_DIR="$PWD/build/DerivedData/Build/Products/Release-iphoneos" \
+            CONFIGURATION_BUILD_DIR="$APP_OUTPUT_DIR" \
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package unsigned IPA
+      - name: Package and verify unsigned IPA
         script: |
           set -e
 
-          rm -rf Payload build/ipa
-          mkdir -p build/ipa
-          mkdir -p Payload
-
-          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/Locus.app"
+          APP_PATH="$PWD/build/DerivedData/Build/Products/Release-iphoneos/Locus.app"
+          IPA_PATH="$PWD/build/ipa/Locus.ipa"
 
           if [ ! -d "$APP_PATH" ]; then
             echo "ERROR: Locus.app was not generated."
             exit 1
           fi
 
-          cp -R "$APP_PATH" Payload/
+          rm -rf "$PWD/Payload" "$PWD/build/ipa"
+          mkdir -p "$PWD/Payload" "$PWD/build/ipa"
+          cp -R "$APP_PATH" "$PWD/Payload/"
 
-          zip -r build/ipa/Locus.ipa Payload
+          cd "$PWD"
+          zip -qry "$IPA_PATH" Payload
 
-          unzip -l build/ipa/Locus.ipa | grep "Payload/Locus.app/Info.plist"
+          if ! unzip -Z1 "$IPA_PATH" | grep -Fxq 'Payload/Locus.app/Info.plist'; then
+            echo "ERROR: IPA Info.plist missing."
+            exit 1
+          fi
 
-          echo "IPA packaging verified."
+          if ! unzip -Z1 "$IPA_PATH" | grep -Fxq 'Payload/Locus.app/Locus'; then
+            echo "ERROR: Locus executable missing."
+            exit 1
+          fi
+
+          echo "IPA packaging verified: Payload/Locus.app is present."
 
     artifacts:
       - build/ipa/*.ipa
